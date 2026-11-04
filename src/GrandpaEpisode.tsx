@@ -18,6 +18,7 @@ import {
   SEATED_GRANDPA_IMAGE,
   SEATED_MUSTACHE,
 } from "./GrandpaSeatedPreview";
+import { MagicDust } from "./MagicDust";
 import { MustachePlacement, TalkingMustache } from "./TalkingMustache";
 
 /** Episode timing, in seconds. */
@@ -28,12 +29,51 @@ export interface EpisodeConfig {
   sittingTransitionSeconds: number;
   /** How long he stays seated before the episode ends. */
   seatedDurationSeconds: number;
+  /** How long he holds the coffee, once seated, before it moves to the table. */
+  coffeePlacementDelaySeconds: number;
+  /** How long the cup takes to travel to the table and settle. */
+  coffeePlacementDurationSeconds: number;
+  /** Whether golden dust appears under the floating cup. */
+  magicDustEnabled: boolean;
+  /** Strength of the dust, from 0 to 1. Affects particle count and opacity. */
+  magicDustIntensity: number;
 }
 
 export const DEFAULT_EPISODE_CONFIG: EpisodeConfig = {
   standingDurationSeconds: 8,
   sittingTransitionSeconds: 2,
   seatedDurationSeconds: 10,
+  coffeePlacementDelaySeconds: 2,
+  coffeePlacementDurationSeconds: 1.2,
+  magicDustEnabled: true,
+  magicDustIntensity: 0.6,
+};
+
+/** Throws if the coffee placement or the dust settings aren't usable. */
+export const validateEpisodeConfig = (config: EpisodeConfig) => {
+  if (config.magicDustIntensity < 0 || config.magicDustIntensity > 1) {
+    throw new Error(
+      `EpisodeConfig: magicDustIntensity (${config.magicDustIntensity}) must be between 0 and 1.`,
+    );
+  }
+
+  const {
+    coffeePlacementDelaySeconds: delay,
+    coffeePlacementDurationSeconds: duration,
+    seatedDurationSeconds: seated,
+  } = config;
+
+  if (delay < 0 || duration < 0) {
+    throw new Error(
+      `EpisodeConfig: coffeePlacementDelaySeconds (${delay}) and coffeePlacementDurationSeconds (${duration}) can't be negative.`,
+    );
+  }
+
+  if (delay + duration > seated) {
+    throw new Error(
+      `EpisodeConfig: coffeePlacementDelaySeconds (${delay}) + coffeePlacementDurationSeconds (${duration}) = ${delay + duration}, which exceeds seatedDurationSeconds (${seated}).`,
+    );
+  }
 };
 
 export const EPISODE_FPS = 30;
@@ -55,11 +95,15 @@ export const getEpisodeDurationInFrames = (
 
 export const calculateEpisodeMetadata: CalculateMetadataFunction<
   GrandpaEpisodeProps
-> = ({ props }) => ({
-  durationInFrames: getEpisodeDurationInFrames(props.config, EPISODE_FPS),
-});
+> = ({ props }) => {
+  validateEpisodeConfig(props.config);
 
-type PoseName = "standing" | "halfSitting" | "seated";
+  return {
+    durationInFrames: getEpisodeDurationInFrames(props.config, EPISODE_FPS),
+  };
+};
+
+type PoseName = "standing" | "halfSitting" | "seated" | "seatedNoCoffee";
 
 type Pose = {
   readonly src: string;
@@ -89,6 +133,29 @@ export const TRANSITION_MUSTACHE: MustachePlacement = {
   rotationDeg: -9,
 };
 
+/**
+ * How the no-coffee drawing lines up with the seated one: it is drawn larger
+ * and offset, so these place its head exactly over the seated pose's head.
+ */
+const NO_COFFEE_ALIGNMENT = {
+  /** Size of the no-coffee image relative to the seated image. */
+  scale: 0.901,
+  /** Top-left of the no-coffee image, on the seated image. */
+  offsetX: 103,
+  offsetY: 5,
+};
+
+const toNoCoffeeX = (seatedImageX: number) =>
+  (seatedImageX - NO_COFFEE_ALIGNMENT.offsetX) / NO_COFFEE_ALIGNMENT.scale;
+const toNoCoffeeY = (seatedImageY: number) =>
+  (seatedImageY - NO_COFFEE_ALIGNMENT.offsetY) / NO_COFFEE_ALIGNMENT.scale;
+
+export const NO_COFFEE_MUSTACHE: MustachePlacement = {
+  noseCenterImageX: toNoCoffeeX(SEATED_MUSTACHE.noseCenterImageX),
+  noseBottomImageY: toNoCoffeeY(SEATED_MUSTACHE.noseBottomImageY),
+  width: SEATED_MUSTACHE.width / NO_COFFEE_ALIGNMENT.scale,
+};
+
 const POSES: Record<PoseName, Pose> = {
   standing: {
     src: staticFile("assets/grandpa-standing-base.png.png"),
@@ -116,6 +183,15 @@ const POSES: Record<PoseName, Pose> = {
     solesImageX: 508.5,
     solesImageY: 1276,
     mustache: SEATED_MUSTACHE,
+  },
+  seatedNoCoffee: {
+    src: staticFile("assets/grandpa-sitting-no-coffee.png"),
+    imageWidth: 1086,
+    imageHeight: 1448,
+    scale: SEATED_GRANDPA.scale * NO_COFFEE_ALIGNMENT.scale,
+    solesImageX: toNoCoffeeX(508.5),
+    solesImageY: toNoCoffeeY(1276),
+    mustache: NO_COFFEE_MUSTACHE,
   },
 };
 
@@ -350,6 +426,91 @@ const PoseLayer: React.FC<{
   );
 };
 
+/**
+ * The separate cup's motion. Positions are in frame pixels and refer to the
+ * center of the bottom of the mug. The first point sits on the cup drawn in the
+ * seated pose; the last is the clear spot on the table, left of the books.
+ */
+export const COFFEE_CUP = {
+  imageWidth: 1376,
+  imageHeight: 1143,
+  /** Center of the bottom of the mug, on the cup's image. */
+  baseImageX: 735,
+  baseImageY: 930,
+  /** Curve from his hand to the table. The two middle points shape the arc. */
+  path: [
+    { x: 1496.6, y: 725 },
+    { x: 1290, y: 790 },
+    { x: 780, y: 745 },
+    { x: 615, y: 848 },
+  ],
+  startScale: 0.095,
+  tableScale: 0.078,
+  /** Tilt at the middle of the flight, in degrees. */
+  flightTiltDeg: -12,
+  /** Fraction of the placement when the cup lands; the rest is settling. */
+  landAt: 0.8,
+  settleSquash: 0.14,
+  settleWiden: 0.08,
+  settleRockDeg: 3,
+};
+
+/** The cup's motion at this point of the placement, from 0 to 1. */
+const getCupMotion = (progress: number) => {
+  const flight = between(progress, 0, COFFEE_CUP.landAt, [0, 1], smooth);
+  const settling = interpolate(progress, [COFFEE_CUP.landAt, 1], [0, 1], {
+    extrapolateLeft: "clamp",
+    extrapolateRight: "clamp",
+  });
+
+  const [p0, p1, p2, p3] = COFFEE_CUP.path;
+  const rest = 1 - flight;
+  const onCurve = (a: number, b: number, c: number, d: number) =>
+    rest * rest * rest * a +
+    3 * rest * rest * flight * b +
+    3 * rest * flight * flight * c +
+    flight * flight * flight * d;
+  const x = onCurve(p0.x, p1.x, p2.x, p3.x);
+  const y = onCurve(p0.y, p1.y, p2.y, p3.y);
+
+  const scale =
+    COFFEE_CUP.startScale +
+    (COFFEE_CUP.tableScale - COFFEE_CUP.startScale) * flight;
+
+  // Both are zero at the start and end of settling, so the cup comes to rest.
+  const squash = Math.sin(Math.PI * settling) * (1 - settling);
+  const rock = Math.sin(2 * Math.PI * settling) * (1 - settling);
+
+  return { flight, x, y, scale, squash, rock };
+};
+
+const CoffeeCup: React.FC<{
+  readonly progress: number;
+  readonly visible: boolean;
+}> = ({ progress, visible }) => {
+  const { flight, x, y, scale, squash, rock } = getCupMotion(progress);
+
+  return (
+    <Img
+      src={staticFile("assets/coffee-cup.png")}
+      style={{
+        position: "absolute",
+        left: x - COFFEE_CUP.baseImageX * scale,
+        top: y - COFFEE_CUP.baseImageY * scale,
+        width: COFFEE_CUP.imageWidth * scale,
+        height: COFFEE_CUP.imageHeight * scale,
+        transformOrigin: `${COFFEE_CUP.baseImageX * scale}px ${COFFEE_CUP.baseImageY * scale}px`,
+        rotate: `${
+          COFFEE_CUP.flightTiltDeg * Math.sin(Math.PI * flight) +
+          COFFEE_CUP.settleRockDeg * rock
+        }deg`,
+        scale: `${1 + COFFEE_CUP.settleWiden * squash} ${1 - COFFEE_CUP.settleSquash * squash}`,
+        visibility: visible ? "visible" : "hidden",
+      }}
+    />
+  );
+};
+
 export const GrandpaEpisode: React.FC<GrandpaEpisodeProps> = ({ config }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
@@ -362,7 +523,26 @@ export const GrandpaEpisode: React.FC<GrandpaEpisodeProps> = ({ config }) => {
       : frame < transitionStart
         ? 0
         : 1;
-  const state = getCharacterState(progress);
+  const movingState = getCharacterState(progress);
+
+  const placementStart =
+    transitionStart +
+    transitionFrames +
+    config.coffeePlacementDelaySeconds * fps;
+  const placementFrames = config.coffeePlacementDurationSeconds * fps;
+  const coffeeReleased = frame >= placementStart;
+  const coffeeProgress =
+    placementFrames > 0
+      ? (frame - placementStart) / placementFrames
+      : coffeeReleased
+        ? 1
+        : 0;
+
+  // On the same frame that the separate cup appears, the character switches to
+  // the drawing without a cup, so there are never two cups on screen.
+  const state: CharacterState = coffeeReleased
+    ? { ...movingState, pose: "seatedNoCoffee" }
+    : movingState;
 
   return (
     <AbsoluteFill>
@@ -373,6 +553,22 @@ export const GrandpaEpisode: React.FC<GrandpaEpisodeProps> = ({ config }) => {
       <PoseLayer name="standing" state={state} />
       <PoseLayer name="halfSitting" state={state} />
       <PoseLayer name="seated" state={state} />
+      <PoseLayer name="seatedNoCoffee" state={state} />
+      {config.magicDustEnabled ? (
+        <MagicDust
+          getSourceAt={(atFrame) =>
+            getCupMotion(
+              placementFrames > 0
+                ? (atFrame - placementStart) / placementFrames
+                : 1,
+            )
+          }
+          startFrame={placementStart}
+          landFrame={placementStart + placementFrames * COFFEE_CUP.landAt}
+          intensity={config.magicDustIntensity}
+        />
+      ) : null}
+      <CoffeeCup progress={coffeeProgress} visible={coffeeReleased} />
     </AbsoluteFill>
   );
 };
